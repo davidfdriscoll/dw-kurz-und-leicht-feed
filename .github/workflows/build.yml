@@ -1,6 +1,10 @@
 name: build feed
 on:
   schedule:
+    # Episodes post Mon-Fri ~8:00-10:30 ET (100-episode sample, Jun-Oct 2026).
+    # 12:00-15:50 UTC covers that window in both EDT and EST.
+    - cron: "*/10 12-15 * * 1-5"
+    # Backstop for stragglers and metadata edits.
     - cron: "17 */3 * * *"
   workflow_dispatch:
   push:
@@ -12,6 +16,8 @@ permissions:
 concurrency:
   group: pages
   cancel-in-progress: false
+env:
+  FEED_URL: https://davidfdriscoll.github.io/dw-kurz-und-leicht-feed/feed.xml
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -25,14 +31,36 @@ jobs:
           python-version: "3.12"
       - run: python build_feed.py
       - name: commit cache
+        id: cache
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898233+github-actions[bot]@users.noreply.github.com"
           git add cache.json
-          git diff --cached --quiet || (git commit -m "update episode cache [skip ci]" && git push)
-      - uses: actions/configure-pages@v5
-      - uses: actions/upload-pages-artifact@v3
+          if git diff --cached --quiet; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            git commit -m "update episode cache [skip ci]" && git push
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+      # The 10-minute morning runs only deploy when a new episode was found.
+      - name: decide whether to deploy
+        id: gate
+        run: echo "deploy=${{ steps.cache.outputs.changed == 'true' || github.event_name != 'schedule' || github.event.schedule == '17 */3 * * *' }}" >> "$GITHUB_OUTPUT"
+      - if: steps.gate.outputs.deploy == 'true'
+        uses: actions/configure-pages@v5
+      - if: steps.gate.outputs.deploy == 'true'
+        uses: actions/upload-pages-artifact@v3
         with:
           path: public
-      - id: deploy
+      - if: steps.gate.outputs.deploy == 'true'
+        id: deploy
         uses: actions/deploy-pages@v4
+      - name: ping Overcast
+        if: steps.cache.outputs.changed == 'true'
+        run: |
+          # Pages can take a moment to serve the new file; wait until it does.
+          for i in $(seq 1 20); do
+            curl -s "$FEED_URL" | grep -q "$(python -c 'import json;print(sorted(json.load(open("cache.json")).values(),key=lambda v:v["url"])[-1]["url"])')" && break
+            sleep 15
+          done
+          curl -s -o /dev/null -w "overcast ping: %{http_code}\n" "https://overcast.fm/ping?urlprefix=$FEED_URL"
